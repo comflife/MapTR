@@ -351,6 +351,8 @@ class VectorizedLocalMap(object):
                 print(f"Warning: Failed to load map {loc}: {e}")
 
         self.ped_crossing_layer = 'crosswalks'
+        self.boundary_layer = 'boundaries'
+        self.boundary_type_fid = 2  # Only use boundary_type_fid=2 for road boundaries
 
     def gen_vectorized_samples(self, location, lidar2global_translation, lidar2global_rotation):
         map_pose = lidar2global_translation[:2]
@@ -703,7 +705,7 @@ class VectorizedLocalMap(object):
         return lines
 
     def get_road_boundary_lines(self, patch_box, patch_angle, location):
-        """road_segments를 union해서 도로 외곽선만 추출"""
+        """boundaries 레이어에서 boundary_type_fid=0인 도로 경계선만 추출"""
         if location not in self.map_apis:
             return []
         
@@ -711,73 +713,49 @@ class VectorizedLocalMap(object):
         patch_x, patch_y = patch_box[0], patch_box[1]
         patch = map_api.get_patch_coord(patch_box, patch_angle)
         
-        polygon_list = []
-        try:
-            records = map_api.load_vector_layer(self.boundary_layer)
-            for geometry in records['geometry']:
-                if geometry is None or geometry.is_empty:
-                    continue
-                new_polygon = geometry.intersection(patch)
-                if new_polygon.is_empty:
-                    continue
-                new_polygon = affinity.rotate(new_polygon, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
-                new_polygon = affinity.affine_transform(new_polygon, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                
-                if new_polygon.geom_type == 'Polygon':
-                    polygon_list.append(new_polygon)
-                elif new_polygon.geom_type == 'MultiPolygon':
-                    polygon_list.extend(list(new_polygon.geoms))
-        except Exception as e:
-            pass
-        
-        if not polygon_list:
-            return []
-        
-        # 모든 road_segments를 union → 전체 도로 영역
-        try:
-            union_road = ops.unary_union(polygon_list)
-        except:
-            return []
-        
-        if union_road.is_empty:
-            return []
-        
-        # 외곽선만 추출
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
         local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
         
-        if union_road.geom_type == 'Polygon':
-            union_road = MultiPolygon([union_road])
-        
         lines = []
-        for poly in union_road.geoms:
-            # 외곽선 (도로 가장자리)
-            ext = LineString(poly.exterior.coords)
-            clipped = ext.intersection(local_patch)
-            if not clipped.is_empty:
-                if clipped.geom_type == 'MultiLineString':
-                    clipped = ops.linemerge(clipped)
-                if clipped.geom_type == 'LineString' and clipped.length > 1.0:
-                    lines.append(clipped)
-                elif clipped.geom_type == 'MultiLineString':
-                    for line in clipped.geoms:
+        try:
+            records = map_api.load_vector_layer(self.boundary_layer)
+            # Filter by boundary_type_fid=0 (road boundaries only)
+            for idx, row in records.iterrows():
+                if row.get('boundary_type_fid', -1) != self.boundary_type_fid:
+                    continue
+                    
+                geometry = row['geometry']
+                if geometry is None or geometry.is_empty:
+                    continue
+                    
+                new_line = geometry.intersection(patch)
+                if new_line.is_empty:
+                    continue
+                    
+                new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+                new_line = affinity.affine_transform(new_line, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                
+                # Clip to local patch
+                new_line = new_line.intersection(local_patch)
+                if new_line.is_empty:
+                    continue
+                
+                # Extract LineStrings
+                if new_line.geom_type == 'LineString':
+                    if new_line.length > 1.0:
+                        lines.append(new_line)
+                elif new_line.geom_type == 'MultiLineString':
+                    for line in new_line.geoms:
                         if line.length > 1.0:
                             lines.append(line)
-            
-            # 내부 홀 (섬 등)
-            for interior in poly.interiors:
-                inter_line = LineString(interior.coords)
-                clipped = inter_line.intersection(local_patch)
-                if not clipped.is_empty:
-                    if clipped.geom_type == 'MultiLineString':
-                        clipped = ops.linemerge(clipped)
-                    if clipped.geom_type == 'LineString' and clipped.length > 1.0:
-                        lines.append(clipped)
-                    elif clipped.geom_type == 'MultiLineString':
-                        for line in clipped.geoms:
-                            if line.length > 1.0:
-                                lines.append(line)
+                elif new_line.geom_type == 'GeometryCollection':
+                    for g in new_line.geoms:
+                        if g.geom_type == 'LineString' and g.length > 1.0:
+                            lines.append(g)
+        except Exception as e:
+            print(f"Error in get_road_boundary_lines: {e}")
+            pass
         
         return lines
 
