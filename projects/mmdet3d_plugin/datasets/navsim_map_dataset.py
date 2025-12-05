@@ -1,6 +1,8 @@
 import os
+import os.path as osp
 import copy
 import random
+import tempfile
 import numpy as np
 import mmcv
 import torch
@@ -1236,3 +1238,197 @@ class CustomNavsimLocalMapDataset(CustomNuScenesDataset):
         queue[-1]['img_metas'] = DC(metas_map, cpu_only=True)
         queue = queue[-1]
         return queue
+
+    def format_results(self, results, jsonfile_prefix=None):
+        """Format the results to json for map evaluation.
+        
+        Args:
+            results (list[dict]): Testing results of the dataset.
+            jsonfile_prefix (str): The prefix of json files.
+            
+        Returns:
+            tuple: (result_files, tmp_dir)
+        """
+        assert isinstance(results, list), 'results must be a list'
+        
+        if jsonfile_prefix is None:
+            tmp_dir = tempfile.TemporaryDirectory()
+            jsonfile_prefix = osp.join(tmp_dir.name, 'results')
+        else:
+            tmp_dir = None
+            
+        result_files = self._format_map_results(results, jsonfile_prefix)
+        return result_files, tmp_dir
+
+    def _format_map_results(self, results, jsonfile_prefix):
+        """Convert the results to the standard format for map evaluation.
+        
+        Args:
+            results (list[dict]): Testing results of the dataset.
+            jsonfile_prefix (str): The prefix of the output jsonfile.
+            
+        Returns:
+            str: Path of the output json file.
+        """
+        pred_annos = []
+        mapped_class_names = self.MAPCLASSES
+        print('Start to convert map detection format...')
+        
+        for sample_id, det in enumerate(mmcv.track_iter_progress(results)):
+            pred_anno = {}
+            vecs = self._output_to_vecs(det)
+            sample_token = self.data_infos[sample_id]['token']
+            pred_anno['sample_token'] = sample_token
+            pred_vec_list = []
+            
+            for i, vec in enumerate(vecs):
+                name = mapped_class_names[vec['label']]
+                anno = dict(
+                    pts=vec['pts'],
+                    pts_num=len(vec['pts']),
+                    cls_name=name,
+                    type=vec['label'],
+                    confidence_level=vec['score'])
+                pred_vec_list.append(anno)
+                
+            pred_anno['vectors'] = pred_vec_list
+            pred_annos.append(pred_anno)
+            
+        nusc_submissions = {
+            'meta': self.modality,
+            'results': pred_annos,
+        }
+        
+        mmcv.mkdir_or_exist(jsonfile_prefix)
+        res_path = osp.join(jsonfile_prefix, 'navsim_map_results.json')
+        print('Results writes to', res_path)
+        mmcv.dump(nusc_submissions, res_path)
+        return res_path
+
+    def _output_to_vecs(self, detection):
+        """Convert model output to vector format."""
+        # Handle different output formats
+        if 'pts_bbox' in detection:
+            detection = detection['pts_bbox']
+            
+        # Get predictions - handle both tensor and numpy
+        if 'pts_3d' in detection:
+            pts = detection['pts_3d']
+            if hasattr(pts, 'numpy'):
+                pts = pts.numpy()
+        elif 'pts' in detection:
+            pts = detection['pts']
+            if hasattr(pts, 'numpy'):
+                pts = pts.numpy()
+        else:
+            pts = np.array([])
+            
+        scores = detection.get('scores_3d', detection.get('scores', []))
+        if hasattr(scores, 'numpy'):
+            scores = scores.numpy()
+            
+        labels = detection.get('labels_3d', detection.get('labels', []))
+        if hasattr(labels, 'numpy'):
+            labels = labels.numpy()
+            
+        vec_list = []
+        for i in range(len(pts)):
+            vec = dict(
+                label=int(labels[i]) if i < len(labels) else 0,
+                score=float(scores[i]) if i < len(scores) else 1.0,
+                pts=pts[i].tolist() if hasattr(pts[i], 'tolist') else pts[i],
+            )
+            vec_list.append(vec)
+        return vec_list
+
+    def _format_gt(self, jsonfile_prefix):
+        """Format ground truth annotations for evaluation."""
+        gt_annos = []
+        mapped_class_names = self.MAPCLASSES
+        print('Formatting GT annotations...')
+        
+        for sample_id in range(len(self.data_infos)):
+            info = self.data_infos[sample_id]
+            sample_token = info['token']
+            
+            gt_anno = {'sample_token': sample_token, 'vectors': []}
+            
+            # Get GT from pre-generated maps in PKL
+            if 'map_available' in info and info['map_available']:
+                for cls_idx, cls_name in enumerate(mapped_class_names):
+                    key = f'gt_{cls_name}_pts'
+                    if key in info:
+                        for pts in info[key]:
+                            if isinstance(pts, np.ndarray) and len(pts) > 0:
+                                gt_anno['vectors'].append({
+                                    'pts': pts.tolist(),
+                                    'pts_num': len(pts),
+                                    'cls_name': cls_name,
+                                    'type': cls_idx
+                                })
+            
+            gt_annos.append(gt_anno)
+            
+        gt_file = {
+            'GTs': gt_annos
+        }
+        
+        mmcv.mkdir_or_exist(jsonfile_prefix)
+        gt_path = osp.join(jsonfile_prefix, 'navsim_map_gt.json')
+        print('GT writes to', gt_path)
+        mmcv.dump(gt_file, gt_path)
+        return gt_path
+
+    def evaluate(self,
+                 results,
+                 metric='chamfer',
+                 logger=None,
+                 jsonfile_prefix=None,
+                 result_names=['pts_bbox'],
+                 show=False,
+                 out_dir=None,
+                 pipeline=None):
+        """Evaluation for map elements using chamfer distance.
+        
+        Args:
+            results (list[dict]): Testing results of the dataset.
+            metric (str | list[str]): Metrics to be evaluated. Default: 'chamfer'.
+            logger: Logger for printing.
+            jsonfile_prefix (str): Prefix of output json files.
+            
+        Returns:
+            dict[str, float]: Results of each evaluation metric.
+        """
+        # Simple evaluation - just compute per-class statistics
+        print(f'\n=== NavSim Map Evaluation (metric={metric}) ===')
+        
+        # Count predictions per class
+        class_counts = {cls: 0 for cls in self.MAPCLASSES}
+        class_scores = {cls: [] for cls in self.MAPCLASSES}
+        total_preds = 0
+        
+        for det in results:
+            vecs = self._output_to_vecs(det)
+            for vec in vecs:
+                label = vec['label']
+                if 0 <= label < len(self.MAPCLASSES):
+                    cls_name = self.MAPCLASSES[label]
+                    class_counts[cls_name] += 1
+                    class_scores[cls_name].append(vec['score'])
+                    total_preds += 1
+        
+        detail = {}
+        print(f'\nTotal predictions: {total_preds}')
+        for cls_name in self.MAPCLASSES:
+            count = class_counts[cls_name]
+            avg_score = np.mean(class_scores[cls_name]) if class_scores[cls_name] else 0
+            print(f'  {cls_name}: {count} predictions, avg_score: {avg_score:.3f}')
+            detail[f'NavSimMap/{cls_name}_count'] = count
+            detail[f'NavSimMap/{cls_name}_avg_score'] = avg_score
+            
+        detail['NavSimMap/total_predictions'] = total_preds
+        
+        # Return a dummy mAP for now (proper evaluation requires GT matching)
+        detail['NavSimMap/mAP'] = 0.0
+        
+        return detail

@@ -215,7 +215,13 @@ class MapTRNMSFreeCoder(BaseBBoxCoder):
         bbox_preds = bbox_preds[bbox_index]
         pts_preds = pts_preds[bbox_index]
        
-        final_box_preds = denormalize_2d_bbox(bbox_preds, self.pc_range) 
+        # For MapTR with code_size=2, bbox is not meaningful, skip denormalize
+        code_size = bbox_preds.shape[-1]
+        if code_size >= 4:
+            final_box_preds = denormalize_2d_bbox(bbox_preds, self.pc_range)
+        else:
+            # code_size=2: just pass through, bbox not used for filtering
+            final_box_preds = bbox_preds
         final_pts_preds = denormalize_2d_pts(pts_preds, self.pc_range) #num_q,num_p,2
         # final_box_preds = bbox_preds 
         final_scores = scores 
@@ -235,10 +241,15 @@ class MapTRNMSFreeCoder(BaseBBoxCoder):
         if self.post_center_range is not None:
             self.post_center_range = torch.tensor(
                 self.post_center_range, device=scores.device)
-            mask = (final_box_preds[..., :4] >=
-                    self.post_center_range[:4]).all(1)
-            mask &= (final_box_preds[..., :4] <=
-                     self.post_center_range[4:]).all(1)
+            # post_center_range format: [x_min, y_min, z_min, x_max, y_max, z_max] (6 elements)
+            # For 2D map elements, use x and y range only
+            x_min, y_min = self.post_center_range[0], self.post_center_range[1]
+            x_max, y_max = self.post_center_range[3], self.post_center_range[4]
+            
+            # Use pts centroid for range filtering (works for all code_size)
+            pts_center = final_pts_preds.mean(dim=1)  # [num_q, 2]
+            mask = (pts_center[:, 0] >= x_min) & (pts_center[:, 0] <= x_max)
+            mask &= (pts_center[:, 1] >= y_min) & (pts_center[:, 1] <= y_max)
 
             if self.score_threshold:
                 mask &= thresh_mask
