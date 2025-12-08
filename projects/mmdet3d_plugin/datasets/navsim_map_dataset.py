@@ -354,7 +354,8 @@ class VectorizedLocalMap(object):
 
         self.ped_crossing_layer = 'crosswalks'
         self.boundary_layer = 'boundaries'
-        self.boundary_type_fid = 2  # Only use boundary_type_fid=2 for road boundaries
+        self.divider_type_fid = 0  # boundary_type_fid=0 for lane dividers
+        self.boundary_type_fid = 2  # boundary_type_fid=2 for road boundaries
 
     def gen_vectorized_samples(self, location, lidar2global_translation, lidar2global_rotation):
         map_pose = lidar2global_translation[:2]
@@ -398,7 +399,7 @@ class VectorizedLocalMap(object):
         return dict(gt_vecs_pts_loc=gt_instance_lines, gt_vecs_label=gt_labels)
 
     def get_lane_dividers(self, patch_box, patch_angle, location):
-        """lanes_polygons에서 인접 차선 사이 경계만 추출 (중복 제거)"""
+        """boundaries 레이어에서 boundary_type_fid=0인 차선 경계 추출"""
         if location not in self.map_apis:
             return []
         
@@ -406,93 +407,51 @@ class VectorizedLocalMap(object):
         patch_x, patch_y = patch_box[0], patch_box[1]
         patch = map_api.get_patch_coord(patch_box, patch_angle)
         
-        # 1. 모든 lane polygon 수집
-        lane_polygons = []
-        try:
-            records = map_api.load_vector_layer('lanes_polygons')
-            for idx, row in records.iterrows():
-                geometry = row['geometry']
-                if geometry is None or geometry.is_empty:
-                    continue
-                clipped = geometry.intersection(patch)
-                if clipped.is_empty:
-                    continue
-                clipped = affinity.rotate(clipped, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
-                clipped = affinity.affine_transform(clipped, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
-                
-                if clipped.geom_type == 'Polygon':
-                    lane_polygons.append(clipped)
-                elif clipped.geom_type == 'MultiPolygon':
-                    lane_polygons.extend(list(clipped.geoms))
-        except Exception as e:
-            return []
-        
-        if len(lane_polygons) < 2:
-            return []
-        
-        # 2. 모든 lane polygon을 union
-        try:
-            all_lanes_union = ops.unary_union(lane_polygons)
-        except:
-            return []
-        
-        # 3. 개별 lane polygon들의 경계선 수집
-        all_boundaries = []
-        for poly in lane_polygons:
-            all_boundaries.append(poly.exterior)
-        
-        # 4. 모든 경계선을 합침
-        try:
-            all_lines = ops.unary_union(all_boundaries)
-        except:
-            return []
-        
-        # 5. Union된 도로 영역의 외곽선 (boundary용)
-        if all_lanes_union.geom_type == 'Polygon':
-            outer_boundary = all_lanes_union.exterior
-        elif all_lanes_union.geom_type == 'MultiPolygon':
-            outer_boundary = ops.unary_union([p.exterior for p in all_lanes_union.geoms])
-        else:
-            outer_boundary = None
-        
-        # 6. Divider = 전체 경계 - 외곽 경계 (차선 사이 경계만 남김)
-        if outer_boundary is not None:
-            try:
-                divider_lines = all_lines.difference(outer_boundary.buffer(0.5))
-            except:
-                divider_lines = all_lines
-        else:
-            divider_lines = all_lines
-        
-        # 7. LineString으로 변환
-        line_list = []
         max_x = self.patch_size[1] / 2
         max_y = self.patch_size[0] / 2
         local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
         
-        def extract_lines(geom):
-            if geom is None or geom.is_empty:
-                return
-            if geom.geom_type == 'LineString':
-                clipped = geom.intersection(local_patch)
-                if not clipped.is_empty and clipped.length > 2.0:
-                    if clipped.geom_type == 'LineString':
-                        line_list.append(clipped)
-                    elif clipped.geom_type == 'MultiLineString':
-                        for line in clipped.geoms:
-                            if line.length > 2.0:
-                                line_list.append(line)
-            elif geom.geom_type == 'MultiLineString':
-                for line in geom.geoms:
-                    extract_lines(line)
-            elif geom.geom_type == 'GeometryCollection':
-                for g in geom.geoms:
-                    extract_lines(g)
-            elif geom.geom_type == 'LinearRing':
-                extract_lines(LineString(geom.coords))
+        lines = []
+        try:
+            records = map_api.load_vector_layer(self.boundary_layer)
+            # Filter by boundary_type_fid=0 (lane dividers)
+            for idx, row in records.iterrows():
+                if row.get('boundary_type_fid', -1) != self.divider_type_fid:
+                    continue
+                    
+                geometry = row['geometry']
+                if geometry is None or geometry.is_empty:
+                    continue
+                    
+                new_line = geometry.intersection(patch)
+                if new_line.is_empty:
+                    continue
+                    
+                new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+                new_line = affinity.affine_transform(new_line, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                
+                # Clip to local patch
+                new_line = new_line.intersection(local_patch)
+                if new_line.is_empty:
+                    continue
+                
+                # Extract LineStrings
+                if new_line.geom_type == 'LineString':
+                    if new_line.length > 1.0:
+                        lines.append(new_line)
+                elif new_line.geom_type == 'MultiLineString':
+                    for line in new_line.geoms:
+                        if line.length > 1.0:
+                            lines.append(line)
+                elif new_line.geom_type == 'GeometryCollection':
+                    for g in new_line.geoms:
+                        if g.geom_type == 'LineString' and g.length > 1.0:
+                            lines.append(g)
+        except Exception as e:
+            print(f"Error in get_lane_dividers: {e}")
+            pass
         
-        extract_lines(divider_lines)
-        return line_list
+        return lines
 
     def get_road_boundary_lines(self, patch_box, patch_angle, location):
         """road_segments를 union해서 도로 가장 바깥 외곽선만 추출"""
@@ -707,7 +666,7 @@ class VectorizedLocalMap(object):
         return lines
 
     def get_road_boundary_lines(self, patch_box, patch_angle, location):
-        """boundaries 레이어에서 boundary_type_fid=0인 도로 경계선만 추출"""
+        """boundaries 레이어에서 boundary_type_fid=2인 도로 경계선만 추출"""
         if location not in self.map_apis:
             return []
         
