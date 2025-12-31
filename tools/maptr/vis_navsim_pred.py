@@ -8,9 +8,9 @@ Usage:
     conda activate navsim
     python tools/maptr/vis_navsim_pred.py \
         projects/configs/maptr/maptr_tiny_r50_navsim_24e.py \
-        work_dirs/maptr_tiny_r50_navsim_24e/epoch_2.pth \
+        work_dirs/maptr_tiny_r50_navsim_24e/epoch_8.pth \
         --show-dir ./vis_navsim_pred \
-        --num-samples 10
+        --num-samples 5
 """
 
 import argparse

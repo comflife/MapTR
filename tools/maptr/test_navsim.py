@@ -8,10 +8,11 @@ Usage:
     cd /home/byounggun/MapTR
     conda activate navsim
     python tools/maptr/test_navsim.py \
-        projects/configs/maptr/maptr_tiny_r50_navsim_24e.py \
-        work_dirs/maptr_tiny_r50_navsim_24e/epoch_2.pth \
-        --show-dir ./vis_navsim_pred \
-        --num-samples 10
+    projects/configs/maptr/maptr_tiny_r50_navsim_24e.py \
+    work_dirs/maptr_tiny_r50_navsim_24e/epoch_24.pth \
+    --show-dir ./vis_navsim_pred \
+    --num-samples 5 \
+    --score-thr 0.3
 """
 
 import argparse

@@ -258,7 +258,7 @@ checkpoint_config = dict(interval=1)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
-work_dir = None
+work_dir = './work_dirs/maptr_tiny_r50_navsim_24e'
 load_from = None
 resume_from = None
 workflow = [('train', 1)]
@@ -429,3 +429,4 @@ lr_config = dict(
 total_epochs = 24
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 fp16 = dict(loss_scale=512.0)
+gpu_ids = range(0, 4)
